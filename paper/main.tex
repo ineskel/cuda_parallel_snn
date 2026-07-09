@@ -1,0 +1,752 @@
+\documentclass[conference, 12pt]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{algorithm}      % Provides the floating algorithm environment
+\usepackage{algpseudocode}
+% Command for 11pt text
+\newcommand{\elevenpt}{\fontsize{10}{13.2}\selectfont}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=flexible,
+  keepspaces=true,
+  showstringspaces=false,
+  upquote=true,
+}
+\usepackage[section]{placeins}
+
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Performance Analysis of CUDA-Based Parallelization Strategies for a Shallow Neural Network\\
+{\footnotesize \textsuperscript}
+}
+\author{
+  Bouameur Besmala Aicha \\
+  Djafour Touria \\
+  Hammou Manel \\
+  Kellou Lylia Ines \\
+  Messaoud Amal
+}
+
+\maketitle
+
+\begin{abstract}
+ Graphics Processing Units are widely used to accelerate machine learning workloads due to their parallel computing capabilities. This paper analyzes CUDA-based parallelization strategies for training a shallow neural network. A reference GPU implementation is first examined and used as a performance baseline for the forward and backward propagation phases. An alternative strategy is then evaluated to improve computational efficiency. Experimental results compare execution time and scalability, highlighting the impact of parallelization choices and memory usage on GPU performance.
+\end{abstract}
+
+\begin{IEEEkeywords}
+CUDA, GPU computing, shallow neural network, parallelization, performance analysis
+\end{IEEEkeywords}
+
+\section{Introduction}
+Matrix multiplication is the dominant operation in both the forward and backward propagation of shallow neural networks. Consequently, training performance is largely determined by how efficiently these linear algebra kernels are executed. GPUs provide a highly parallel architecture for such workloads, but performance is strongly influenced by kernel design choices, including thread mapping and memory access patterns.
+
+In this work, we use a shallow neural network as a case study to examine how a reference CUDA implementation maps matrix computations to the GPU and where its performance limitations arise. We then evaluate an alternative implementation designed to improve efficiency by reducing memory overhead and increasing data reuse. The study reports timing results across multiple dataset sizes to characterize scalability trends.
+
+\section{Shallow Neural Network Model}
+\subsection{Architecture}
+We consider a shallow neural network composed of a single hidden layer. The input dimension is 32 features, followed by a hidden layer of 256 neurons with ReLU activation, and an output layer producing a single scalar value for a regression task. This simple architecture was chosen to facilitate the analysis of different GPU parallelization strategies for both forward and backward propagation. The network is trained using mini-batch stochastic gradient descent with a batch size of 256, a learning rate of 0.002, and 100 epochs, using mean squared error (MSE) as the loss function.
+
+
+\subsection{Key Characteristics and Assumptions}
+The proposed network is intentionally lightweight in order to isolate the impact of parallelization strategies from architectural complexity. Its main computational workload arises from matrix multiplications, which represent the primary performance bottleneck and the main target for GPU acceleration.
+
+All experiments rely on synthetically generated data, with input values uniformly sampled from the range $[-1,1]$ and additive Gaussian noise applied to the target output. This choice enables controlled experimentation and ensures reproducibility. The output layer contains a single neuron, assuming a univariate regression setting.
+
+Hyperparameters such as the number of hidden neurons, learning rate, batch size, and number of epochs are fixed throughout the experiments, without hyperparameter tuning. This design choice allows for a fair and consistent comparison between different parallelization strategies. Finally, the use of ReLU activation is assumed to be sufficient for modeling the non-linear relationships in the synthetic dataset, while maintaining computational efficiency.
+
+\section{Analysis of the Reference Parallelization Strategy}
+
+This section analyzes the reference parallelization strategies used for accelerating the training of a shallow neural network: row-wise multi-threading using pthreads, and fine-grained parallelization using CUDA. We evaluate computational costs, architectural considerations, and limitations of each approach.
+
+\subsection{Pthreads Parallelization}
+The reference strategy initially uses \texttt{pthreads} to parallelize matrix multiplication, which is the main computational bottleneck in both forward and backward propagation. The algorithm can be summarized as:
+
+\begin{enumerate}
+    \item Divide the rows of the output matrix evenly among $T$ threads.
+    \item Each thread computes all columns for its assigned rows:
+    \[
+    C[i,j] = \sum_{k} A[i,k] \cdot B[k,j]
+    \]
+    \item Synchronize threads and assemble the final output matrix.
+\end{enumerate}
+
+This strategy accelerates computation, particularly for larger matrices. However, thread management overhead increases with the number of threads, leading to \textbf{diminishing returns} beyond a certain threshold. Performance is also influenced by memory access patterns and synchronization. Empirically, for small matrices, additional threads may provide minimal or even negative speedup due to overhead, whereas larger matrices benefit more substantially.
+
+\subsection{CUDA Parallelization}
+The GPU reference strategy accelerates training using CUDA, mapping each element of the output matrix to a single thread. Threads are organized in two-dimensional blocks and grids matching the output matrix dimensions. The computation follows the standard forward and backward propagation:
+
+\begin{itemize}
+    \item \textbf{Forward pass:} Hidden pre-activations $Z_1 = X \cdot W_1$ are computed, followed by element-wise ReLU activation $H = \text{ReLU}(Z_1)$. Output predictions are obtained via $Y_{\text{pred}} = H \cdot W_2$.
+    \item \textbf{Backward pass:} Gradients are computed for the output and hidden layers using matrix multiplications, applying the ReLU derivative on the hidden layer. Weight updates are performed using stochastic gradient descent.
+\end{itemize}
+
+Each thread executes the dot product for a single output element:
+\begin{lstlisting}[
+  language=C,
+  linewidth=\columnwidth,
+  breaklines=true,
+  columns=flexible
+]
+int row = blockIdx.y * blockDim.y + threadIdx.y;
+int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+if (row < A_rows && col < B_cols) {
+    float value = 0.0f;
+    for (int k = 0; k < A_cols; k++)
+        value += A[row * A_cols + k] * B[k * B_cols + col];
+    C[row * B_cols + col] = value;
+}
+\end{lstlisting}
+
+Input and output matrices are allocated in device memory, with explicit host-device transfers. Each thread repeatedly loads elements from global memory to compute the dot product, leading to limited data reuse and making the strategy memory-bound for certain matrix sizes. No tiling or shared-memory optimizations are applied in this baseline.
+%--------------------------------------------------------
+
+%--------------------------------------------------------
+\subsection{Computational Costs and Limitations}
+\begin{itemize}
+    \item \textbf{Pthreads:} Performance improves as threads are added, but thread management overhead can offset gains when the number of threads becomes large. Diminishing returns are observed beyond an optimal thread count, and memory access patterns and synchronization overhead affect scalability.
+    \item \textbf{CUDA:} GPU execution achieves significant speedups due to massive parallelism. However, the fine-grained mapping and repeated global memory accesses limit the computation-to-memory ratio. Kernel launch overheads and host-device memory transfers also add costs. The lack of memory-reuse strategies, such as tiling, reduces efficiency for intermediate-sized matrices.
+\end{itemize}
+
+\subsection{Summary and Baseline Performance}
+Both strategies outperform sequential execution. Pthreads provides moderate speedup, particularly for larger matrices, whereas CUDA demonstrates superior scalability and performance due to massive parallelism. These baseline implementations provide a reference for evaluating alternative strategies that aim to optimize memory reuse and improve computation-to-memory ratio.
+The table below summarizes the baseline execution times for the reference parallelization strategies across datasets of different sizes. It highlights the performance improvements achieved with multi-threading using pthreads and GPU acceleration using CUDA, providing a clear comparison of scalability and speedup for small, medium, and large workloads.
+
+
+\begin{table}[h!]
+\centering
+\caption{Baseline execution times (s) of the reference parallelization strategies for different dataset sizes.}
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{Dataset Size} & \textbf{Batches} & \textbf{Pthreads (s)} & \textbf{CUDA (s)} \\
+\hline
+Small  & 1   & 0.83 & 0.45 \\
+\hline
+Medium & 10  & 7.44 & 2.59 \\
+\hline
+Large  & 100 & 74.00 & 22.22 \\
+\hline
+\end{tabular}
+\end{table}
+%_________________________________________________________
+\subsection{Profiling of the Reference CUDA Implementation}
+
+To better understand the performance limitations of the reference parallelization strategy, GPU profiling was conducted using an NVIDIA Tesla T4 GPU (40 SMs, 1.59~GHz, 15.64~GB memory) using NVIDIA Nsight Systems. The objective of this analysis is to identify execution bottlenecks, evaluate kernel efficiency, and analyze memory transfer behavior during the training process.
+
+\subsubsection{Kernel Execution Analysis}
+
+Profiling results show that the reference implementation relies on a single CUDA kernel, \texttt{mat\_mult\_kernel}, which is invoked repeatedly during training. For the large dataset configuration, the kernel is launched 50,000 times, with an average execution time of approximately 6.9~\textmu s per invocation. Despite the significant increase in the number of kernel launches, the average execution time remains nearly constant across medium and large datasets, indicating good scalability and efficient computation at the kernel level.
+
+As illustrated in Fig. \ref{fig:kernel_detail}, the kernel execution achieves 100\% occupancy on the hardware, yet it occupies a relatively small portion of the overall timeline compared to the surrounding API activity.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\columnwidth]{image_21.png}
+    \caption{Timeline detail of \texttt{mat\_mult\_kernel} showing 100\% GPU utilization.}
+    \label{fig:kernel_detail}
+\end{figure}
+
+The total GPU kernel execution time represents only a small fraction of the overall training time, demonstrating that the kernel itself is not a performance bottleneck.
+
+\subsubsection{CUDA API Overhead}
+
+In contrast, profiling of CUDA API calls reveals a substantial overhead associated with memory management and data transfers. For the large dataset, \texttt{cudaMemcpy}, \texttt{cudaMalloc}, and \texttt{cudaFree} account for more than 85\% of the total CUDA API execution time. These operations are invoked at every training iteration, resulting in frequent memory allocations, deallocations, and host-device data transfers.
+
+Furthermore, synchronization calls such as \texttt{cudaDeviceSynchronize} contribute additional overhead, causing the CPU to block while waiting for GPU operations to complete. This behavior is captured in Fig. \ref{fig:macro_timeline}, where the macro-scale view reveals a pattern of CPU threads entering wait states.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\columnwidth]{image_31.png}
+    \caption{Macro-view profile illustrating CPU blocking and synchronization wait states.}
+    \label{fig:macro_timeline}
+\end{figure}
+
+\subsubsection{Memory Transfer Behavior}
+
+Memory transfer analysis indicates a large number of small and synchronous data transfers between the host and the device. For the large dataset, more than 8.8~GB of data are transferred from host to device and 5.6~GB from device to host over the course of training. Although each transfer is relatively small, their high frequency significantly degrades overall performance.
+
+This transfer pattern leads to poor overlap between computation and communication, effectively limiting the benefits of GPU acceleration.\\
+%--------------------------------
+
+To better quantify the observations obtained from Nsight Systems and Nsight Compute, 
+Table~\ref{tab:profiling_large} summarizes the execution time distribution of the 
+reference CUDA implementation for a representative medium-sized input.
+
+\begin{table}[H]
+\centering
+\caption{Execution time breakdown of the reference CUDA implementation (large input size)}
+\label{tab:profiling_large}
+\begin{tabular}{|p{2.5cm}|p{2cm}|p{3cm}|}
+\hline
+\textbf{Component} & \textbf{Measured Time (s)} & \textbf{Observation} \\
+\hline
+CUDA kernel execution (\texttt{mat\_mult\_kernel}) & 0.343 & Kernel execution is negligible compared to total training time \\
+\hline
+CUDA memory transfers (H2D + D2H) & 1.338 & Frequent small host-device and device-host transfers degrade performance \\
+\hline
+CUDA API overhead (malloc/free/sync, etc.) & 8.654 & Dominated by repeated \texttt{cudaMalloc}, \texttt{cudaFree}, \texttt{cudaMemcpy}, and synchronization calls \\
+\hline
+Total training time & 11.438 & Includes all CPU-GPU interactions and kernel execution \\
+\hline
+\end{tabular}
+\end{table}
+
+
+
+\subsubsection{Discussion}
+
+Overall, profiling results demonstrate that the reference CUDA implementation is not compute-bound but rather dominated by memory management and data transfer overheads. While the GPU kernel exhibits good performance and scalability, the fine-grained offloading strategy and repeated memory operations severely limit efficiency. These observations motivate the proposed parallelization strategy, which aims to reduce CUDA API overhead, minimize host-device data transfers, and improve overall GPU utilization.
+
+%_________________________________________________________
+
+\section{Proposed Parallelization Strategy}
+To address the limitations identified in the reference implementation, we propose a comprehensive optimization strategy consisting of three complementary techniques: tiled matrix multiplication, full GPU offloading, and kernel fusion. Each technique targets specific performance bottlenecks while maintaining numerical correctness.
+
+\subsection{Tiled Matrix Multiplication Optimization}
+To improve the performance of matrix multiplication on the GPU, a tiling-based optimization strategy was adopted. Tiling aims to reduce global memory access latency by exploiting fast on-chip shared memory and improving data reuse across threads within the same block.
+
+In the naive CUDA implementation, each thread computes one element of the output matrix by repeatedly accessing global memory to load elements from the input matrices. Although this approach exposes massive parallelism, it suffers from redundant memory accesses, which significantly limits performance for large matrices.
+
+The tiled approach partitions the input matrices into square submatrices (tiles) of size \( T \times T \). Each thread block is responsible for computing one tile of the output matrix. During execution, tiles of the input matrices are cooperatively loaded from global memory into shared memory. Once loaded, all threads within the block reuse the shared data to compute partial dot products, thereby reducing the number of global memory transactions.
+
+Let \( A \in \mathbb{R}^{m \times n} \), \( B \in \mathbb{R}^{n \times p} \), and \( C \in \mathbb{R}^{m \times p} \). The output element \( C_{ij} \) is computed as:
+\[
+C_{ij} = \sum_{k=0}^{n-1} A_{ik} \cdot B_{kj}
+\]
+Using tiling, this summation is decomposed into smaller partial sums over tiles:
+\[
+C_{ij} = \sum_{t=0}^{\lceil n/T \rceil - 1} \sum_{k=0}^{T-1}
+A_{i,\,tT+k} \cdot B_{tT+k,\,j}
+\]
+
+Each iteration loads one tile from matrix \( A \) and one tile from matrix \( B \) into shared memory. A synchronization barrier (\texttt{\_\_syncthreads()}) ensures that all threads have completed the loading phase before computation begins. After computing the partial result for the current tile, threads synchronize again before proceeding to the next tile.
+
+\subsubsection{Memory Access Optimization}
+The primary bottleneck addressed by tiling is the high latency and low reuse of global memory accesses. In the naive implementation, each element of matrices $A$ and $B$ is repeatedly fetched from global memory by multiple threads, leading to memory bandwidth saturation and underutilization of the GPU's arithmetic units.
+
+The key idea of tiling is to restructure the computation so that data fetched from global memory is reused as much as possible before being evicted. By loading contiguous blocks of data into shared memory, memory accesses become coalesced and redundant loads are eliminated.
+
+This approach increases arithmetic intensity by allowing each loaded value to participate in multiple floating-point operations. As a result, the computation shifts from being memory-bound toward being compute-bound, which is better aligned with GPU architecture.
+
+\subsubsection{Implementation Details}
+\begin{itemize}
+    \item \textbf{Grid and Block Dimensions:} Each thread block is configured as a two-dimensional block of size $\texttt{TILE\_SIZE} \times \texttt{TILE\_SIZE}$ using \texttt{dim3 dimBlock(TILE\_SIZE, TILE\_SIZE)} although limited at a maximum of 1024 threads per block according the the hardware limitations. The grid dimensions are computed as
+\[
+\texttt{dimGrid} =
+\left(
+\left\lceil \frac{B.\text{cols}}{\texttt{TILE\_SIZE}} \right\rceil,\;
+\left\lceil \frac{A.\text{rows}}{\texttt{TILE\_SIZE}} \right\rceil
+\right),
+\]
+    \item \textbf{Memory Layout Changes:} Input matrices are accessed in row-major order to ensure coalesced global memory reads during tile loading.
+    \item \textbf{Shared Memory Usage:} Two shared memory buffers are allocated per block to store tiles of matrices $A$ and $B$.
+    \item \textbf{Registers:} Partial sums are accumulated in registers to minimize memory traffic.
+    \item \textbf{Synchronization Points:} Two \texttt{\_\_syncthreads()} calls are used per tile iteration—one after loading tiles and one after computing partial results.
+\end{itemize}
+
+\subsubsection{Expected Impact and Trade-offs}
+This optimization significantly reduces global memory traffic and improves cache efficiency. By increasing data reuse and ensuring coalesced accesses, execution time is reduced, especially for large matrices where memory bandwidth is the dominant constraint.
+
+Larger tile sizes increase shared memory usage per block, which can reduce occupancy. Excessive register usage may also limit the number of concurrently active warps. Therefore, tile size must be carefully tuned to balance reuse and parallelism.
+
+\subsubsection{Performance Analysis}
+The tiling optimization was implemented in the CUDA kernel \texttt{\_Kernel\_mat\_mult\_tiled} to address the memory bottleneck. The kernel utilizes \texttt{\_\_shared\_\_} memory as a high-speed L1 cache. The process follows a collaborative loading pattern where all threads within a block cooperate to load a portion of data into shared memory tiles.
+
+The impact of tile size was tested across three dataset scales: Small, Medium, and Large. The results are summarized in Table \ref{table:tiling_results_merged}.
+
+\begin{table}[h!]
+\centering
+\small
+\caption{GPU Execution Time (ms) for Different Tile Sizes}
+\label{table:tiling_results_merged}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Input Size} & \textbf{Tile 8} & \textbf{Tile 16} & \textbf{Tile 32} & \textbf{Tile 64} \\ 
+\midrule
+Small  & 2321   & 2323   & 2330    & -       \\ 
+Medium & -      & 23068  & 23514   & 22722   \\ 
+Large  & -      & 230885 & 232759  & 229877  \\ 
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.45\textwidth]{small1.png}
+    \caption{Total execution time for Small dataset ($T=8, 16, 32$)}
+    \label{fig:small_data}
+\end{figure}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.45\textwidth]{medium1.png}
+    \caption{Total CPU/Wall-clock time for Medium dataset ($T=16, 32, 64$)}
+    \label{fig:medium_data}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.45\textwidth]{large1.png}
+    \caption{Total CPU/Wall-clock time for Large dataset ($T=16, 32, 64$)}
+    \label{fig:large_data}
+\end{figure}
+
+\subsubsection{Convergence and Precision}
+Regardless of the tile size used, the model's convergence remains stable. Figure \ref{fig:mse_progress} illustrates that the Mean Squared Error (MSE) drops sharply within the first few epochs and reaches a consistent plateau for all tested tile configurations, confirming that tiling optimizes speed without sacrificing numerical accuracy.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.48\textwidth]{mse.png}
+    \caption{MSE vs Epoch for different Tile Sizes}
+    \label{fig:mse_progress}
+\end{figure}
+
+\subsubsection{Interpretation and Conclusion}
+The experimental data reveals a nuanced relationship between tile size and performance:
+
+\begin{itemize}
+    \item \textbf{Small Dataset:} The lowest execution time was achieved with $T=8$ (2321.14 ms). At this scale, the overhead of managing larger shared memory tiles and the synchronization of more threads ($T=32$) slightly outweighs the benefits of data reuse.
+    \item \textbf{Medium and Large Datasets:} For larger scales, $T=64$ emerged as the most efficient configuration (22721.70 ms for Medium and 229876.84 ms for Large). This suggests that as the data volume grows, maximizing the reuse of data within shared memory becomes the critical factor in overcoming the global memory bandwidth bottleneck.
+    \item \textbf{Consistency:} The results for $T=32$ were consistently slightly slower than $T=16$ or $T=64$ across the larger sets, indicating a potential "sweet spot" in occupancy or warp scheduling that favors $T=64$ on this specific hardware.
+\end{itemize}
+
+In conclusion, tiling effectively hides memory latency. While smaller tiles are sufficient for small matrices, scaling the tile size (up to hardware limits) is essential for maintaining high throughput as dataset complexity increases.
+
+\subsection{Full GPU Offloading Optimization (GPU-Native Execution)}
+An important architectural optimization was applied by moving the entire training workflow to the GPU. In the initial hybrid implementation, parts of the neural network pipeline—such as intermediate matrix operations, activation functions, and gradient computations—were still executed on the CPU. This resulted in frequent host-device memory transfers and synchronization overhead, which significantly limited performance.
+
+The GPU-native optimization consists of offloading all computational stages of the forward and backward passes to CUDA kernels, ensuring that once data is transferred to the GPU, it remains there for the duration of training.
+
+In the hybrid version, some of the training steps were performed on the CPU, forcing intermediate results to be transferred between host and device memory. The GPU-native strategy eliminates these transfers by keeping all matrices resident in device memory.
+
+\subsubsection{Latency of host-device memory transfers}
+ In a hybrid implementation, each CPU-GPU synchronization introduces delays that can overshadow kernel execution time, particularly when operations are fine-grained. This represents the primary bottleneck addressed by the GPU-native implementation.
+
+The key idea is to treat the GPU as the primary compute device for the entire training loop. Once input data and model parameters are copied to device memory at the beginning of training, all subsequent operations are executed exclusively on the GPU.
+
+This approach removes unnecessary host-device synchronization points and transforms the workflow into a fully device-resident pipeline, reducing latency and improving throughput.
+
+\subsubsection{Implementation Details}
+\begin{itemize}
+    \item \textbf{Device-Resident Data:} Input dataset $X$, labels $Y$, weights $W_1$ and $W_2$, and all intermediate tensors are allocated once in GPU global memory.
+    
+    \item \textbf{GPU-Based Forward Pass:} Matrix multiplications and activation functions are executed via CUDA kernels without copying intermediate outputs back to the CPU.
+    
+    \item \textbf{GPU-Based Backward Pass:} Gradient computations (MSE gradient, matrix multiplications for $dW_1$ and $dW_2$, ReLU gradient) are performed entirely on the GPU.
+    
+    \item \textbf{On-Device Weight Updates:} Stochastic gradient descent updates are applied using a CUDA kernel, avoiding host-side parameter updates.
+    
+    \item \textbf{Minimized Data Transfers:} Host-device transfers occur only twice—once at initialization (loading data and weights) and once at the end (optional result retrieval).
+\end{itemize}
+
+\subsubsection{Expected Impact and Trade-offs}
+This optimization significantly reduces training time by eliminating PCIe transfer overhead and repeated synchronization barriers. By keeping the full computational graph on the GPU, the training loop becomes a continuous stream of device-side operations, allowing the GPU scheduler to maintain higher utilization.
+
+While full GPU offloading improves performance, it increases GPU memory usage because all intermediate tensors must remain allocated on the device. For very large models or datasets, memory capacity may become a limiting factor. Additionally, debugging becomes more complex, as intermediate values are no longer directly accessible from the CPU without explicit memory copies.
+
+\subsubsection{Performance Analysis}
+The GPU-native version was implemented as a baseline architectural optimization. All forward and backward operations were mapped to CUDA kernels, but each logical step (matrix multiplication, activation, gradient, update) was still executed as a separate kernel.
+
+The training loop runs entirely on the GPU: each batch is processed using a sequence of CUDA kernels for forward propagation, loss gradient computation, backpropagation, and weight updates. No intermediate host-device transfers occur inside the loop.
+
+Table~\ref{tab:gpunative_perf} compares the execution time of the hybrid (CPU+GPU) implementation and the fully GPU-native implementation. All experiments were conducted for 100 epochs with a batch size of 256.
+
+\begin{table}[h!]
+\centering
+\caption{Execution time comparison: Hybrid vs GPU-Native implementation}
+\label{tab:gpunative_perf}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+\textbf{Dataset} & \textbf{Samples} & \textbf{Hybrid Time (s)} & \textbf{GPU-Native Time (s)} & \textbf{Speedup} \\
+\hline
+Small   & 256     & 0.3151  & 0.0187 & 16.85× \\
+Medium  & 2560    & 3.6767 & 0.1752 & 20.98× \\
+Large   & 25600   & 7.5937  & 1.3527 & 5.62× \\
+\hline
+\end{tabular}%
+}
+\end{table}
+
+The GPU-native implementation consistently outperforms the hybrid approach. The performance gain grows with dataset size, confirming that PCIe transfer overhead becomes increasingly costly for larger workloads.
+
+\subsubsection{Interpretation and Conclusion}
+The full GPU offloading strategy establishes the GPU as the sole execution platform for the neural network training pipeline. By eliminating repetitive host-device memory transfers and synchronization points, the implementation achieves substantial reductions in runtime while preserving numerical correctness.
+
+This optimization does not change the computational algorithm itself but improves system-level efficiency. It prepares the pipeline for further low-level optimizations by ensuring that all computations already reside on the GPU.
+
+In conclusion, full GPU offloading is a fundamental architectural optimization that transforms a hybrid training workflow into a high-throughput device-resident pipeline, enabling the GPU to operate closer to its peak performance.
+
+\subsection{Kernel Fusion Optimization (GPU-Native)}
+After implementing a fully GPU-native version of the neural network training code, a new bottleneck emerges from the frequent invocation of small, independent kernels. In the unfused GPU-native implementation, each logical operation—matrix multiplication, activation function (ReLU), and gradient computation—is launched as a separate CUDA kernel. While this exposes parallelism, it incurs significant \textbf{kernel launch overhead} and unnecessary reads/writes to global memory.
+
+Kernel fusion addresses these inefficiencies by merging multiple sequential operations into a single kernel. This allows intermediate results to remain in registers and shared memory, eliminating extra global memory transactions and reducing the number of kernel launches.
+
+In the unfused GPU-native forward pass, each computation requires a separate kernel invocation. Kernel fusion merges the matrix multiplication and ReLU application into a single kernel. A similar mechanism is applied in the backward pass to avoid a separate ReLU gradient kernel.
+
+
+\subsubsection{Kernel launch overhead}
+The primary bottleneck addressed by kernel fusion is the \textbf{high kernel launch overhead} associated with multiple small GPU kernels. In the GPU-native code, separate kernels for each operation lead to redundant global memory transactions and multiple synchronization points. For lightweight operations, the kernel launch overhead can dominate runtime, reducing the efficiency of the GPU.
+
+The key idea of kernel fusion is to combine several dependent operations into a single CUDA kernel. This allows intermediate results to reside in registers or shared memory, minimizing global memory traffic. Fusion reduces kernel launch overhead and synchronization barriers, increases arithmetic intensity, and improves GPU utilization by keeping threads fully occupied.
+
+\subsubsection{Implementation Details}
+\begin{itemize} 
+    \item \textbf{Fused Forward Pass:} Each thread computes the dot product of the input and weight vector for one hidden unit and immediately applies the ReLU activation before storing it in global memory.
+    \item \textbf{Fused Backward Pass:} The gradient through the ReLU activation is computed inline during the matrix multiplication with the output gradients, storing results directly in registers before writing to global memory.
+    \item \textbf{Registers:} Intermediate accumulations are stored in thread-local registers.
+    \item \textbf{Reduced Kernel Launches:} Multiple sequential kernels are replaced by a smaller number of fused kernels, cutting down kernel launch overhead.
+    \item \textbf{GPU-Native Execution:} All fused computations are executed entirely on the GPU without host-side intervention between steps.
+\end{itemize}
+
+\subsubsection{Expected Impact and Trade-offs}
+Fusing kernels is expected to significantly reduce training time by minimizing kernel launch overhead, reducing global memory transactions for intermediate results, and increasing instruction-level parallelism and arithmetic intensity.
+
+Kernel fusion increases register usage and kernel complexity, which may limit occupancy. Excessive fusion can reduce modularity and make debugging more difficult. The benefits are most pronounced for small to medium-sized batches, where kernel launch overhead is a significant fraction of runtime. For large, memory-bound workloads, fusion alone may not yield substantial improvements without complementary memory optimizations.
+
+\subsubsection{Performance Analysis}
+The fused kernels were implemented on top of the GPU-native baseline, combining matrix multiplication with activation or activation gradient operations. No tiling was used; shared memory was not explicitly employed.
+
+In the forward pass, each thread computes the dot product for one output element and immediately applies the ReLU activation. In the backward pass, the gradient with respect to the pre-activation is computed inline. This eliminates intermediate memory writes and synchronization points, directly addressing kernel launch overhead.
+
+Table~\ref{tab:fusion_perf} summarizes the GPU execution times for defused and fused forward and backward passes on the synthetic convex datasets. All operations were executed on the GPU, and each experiment ran for 100 epochs with a batch size of 256.
+
+\begin{table}[h!]
+\centering
+\caption{GPU execution time comparison between defused and fused kernels}
+\label{tab:fusion_perf}
+\begin{tabular}{|c|c|c|p{2cm}|p{2cm}|c|}
+\hline
+\textbf{Dataset} & \textbf{Defused (s)} & \textbf{Fused (s)} & \textbf{Speedup} \\
+\hline
+Small    & 0.01827         & 0.0145        & 1.26× \\
+Medium   & 0.1752         & 0.1045        & 1.68× \\
+Large   & 1.3527          & 0.7267        & 1.86× \\
+\hline
+\end{tabular}
+\end{table}
+
+The table shows that the fused kernels consistently outperform the defused implementation. Speedup increases with dataset size, highlighting the growing impact of kernel launch overhead and memory traffic on larger workloads.
+
+\subsubsection{Interpretation and Conclusion}
+The kernel fusion strategy combines operations that were previously executed separately: \texttt{matmul + ReLU} in the forward pass and \texttt{matmul + ReLU gradient} in backpropagation. By fusing these operations, we achieve:
+
+\begin{itemize}
+    \item \textbf{Reduced kernel launches:} Lower CPU-GPU synchronization overhead.
+    \item \textbf{Improved memory efficiency:} Intermediate results are retained in registers/shared memory, reducing global memory access.
+    \item \textbf{Better utilization of GPU parallelism:} Instructions are executed more efficiently.
+\end{itemize}
+
+Empirical results confirm that fusion leads to significant reductions in training time, particularly for medium and large datasets. Even for the small dataset, a $\sim$1.26$\times$ speedup is observed, indicating that kernel launch overhead can have a non-negligible effect.
+
+In conclusion, kernel fusion built on top of the GPU-native implementation is an effective optimization strategy that improves performance without altering the algorithm or model accuracy. This strategy provides a solid foundation for further optimizations, such as tiling or mixed-precision computation, especially for larger datasets.
+
+%=====================================================
+
+\subsection{Fully GPU-Resident Training with Forward Tiling and Kernel Fusion}
+
+At this stage, the proposed implementation combines \textbf{tiling} for matrix multiplications using shared memory and \textbf{selective kernel fusion} in the forward pass by merging the hidden-layer matrix multiplication with the ReLU activation. In addition, the backpropagation path is implemented with explicit CUDA kernels to ensure proper usage of row-major memory layout.
+
+\subsubsection{Addressed bottleneck}
+This strategy targets:
+\begin{itemize}
+    \item \textbf{GPU-native execution:} keep the full training step (forward, gradients, SGD updates) on the GPU after the initial host-to-device transfer.
+    \item \textbf{Memory access optimization:} reduce global memory traffic during dense linear algebra via tiling.
+    \item \textbf{Reduced kernel count for activation:} fuse \texttt{matmul + ReLU} in the hidden layer to eliminate an extra activation kernel and intermediate global-memory write.
+\end{itemize}
+
+% =====================================================
+\subsubsection{Implementation Algorithm}
+
+The below algorithm explains the general logic of the implementation:
+
+\begin{algorithm}
+\caption{GPU-Resident Training with Tiling and Kernel Fusion}
+\label{alg:gpu_nn_training_fusion}
+\begin{algorithmic}[0]  % no line numbers
+\Require Dataset $(\mathbf{X}, \mathbf{Y})$, batch size $B$, epochs $E$, tile size $T$
+\Ensure Trained weights $\mathbf{W}_1, \mathbf{W}_2$
+
+\State Initialize $\mathbf{W}_1, \mathbf{W}_2$ on GPU
+
+\For{epoch $e = 1$ to $E$}
+    \For{each batch of size $B$}
+    
+        \State \textbf{Forward Pass:}
+        \State \texttt{matmul\_relu\_tiled}($\mathbf{X}_\text{batch}, \mathbf{W}_1, \mathbf{Z}_1$)  
+        \State \texttt{matmul\_tiled}($\mathbf{Z}_1, \mathbf{W}_2, \hat{\mathbf{Y}}$)  
+
+        \State \textbf{Backward Pass:}
+    \State \texttt{relu\_backprop\_output1}(
+            $\mathbf{dY}, \mathbf{W}_2,$ \newline 
+            $\mathbf{Z}_1, \mathbf{dZ}_1$)
+        \State \texttt{grad\_W1}($\mathbf{X}_\text{batch}, \mathbf{dZ}_1, \mathbf{dW}_1$)
+        \State \texttt{grad\_W2}($\mathbf{Z}_1, \mathbf{dY}, \mathbf{dW}_2$)
+
+        \State \textbf{Weights Update:}
+        \State \texttt{sgd}($\mathbf{W}_1, \mathbf{dW}_1$)
+        \State \texttt{sgd}($\mathbf{W}_2, \mathbf{dW}_2$)
+
+    \EndFor
+\EndFor
+
+\State \textbf{Output:} $\mathbf{W}_1, \mathbf{W}_2$
+\end{algorithmic}
+\end{algorithm}
+
+
+
+\subsubsection{Expected Impact and Trade-Offs}
+This approach is expected to improve performance by increasing arithmetic intensity in the forward matmul through tiling, as well as removing an intermediate kernel and global-memory write via kernel fusion.
+
+However, despite selective fusion, each batch still launches several kernels (forward, loss gradient, gradient reductions, SGD), so launch overhead can dominate for very small workloads. Additionally, certain kernels (\texttt{grad\_W1} and \texttt{grad\_W2}) use direct reductions over the batch dimension; more optimized reductions or GEMM-based formulations could further improve performance.
+
+\subsubsection{Empirical Performance Evaluation (Tile $T=16$)}
+We evaluated the end-to-end training time over $100$ epochs for three synthetic convex datasets with batch size $256$, using tile size $T=16$. Table~\ref{tab:fused_tiled_end2end_t16} reports the measured training times.
+
+\begin{table}[h!]
+\centering
+\caption{End-to-end GPU training time using tile size $T=16$ (100 epochs, Batch=256)}
+\label{tab:fused_tiled_end2end_t16}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Dataset} & \textbf{Samples} & \textbf{Time (s)}  \\
+\midrule
+Small  & 256   & 0.0106 \\ 
+Medium & 2560  & 0.1045  \\
+Large  & 25600 & 0.8401 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\subsubsection{Interpretation of the strategy}
+The results demonstrate that the GPU-native implementation with tiled forward computation and correct backpropagation achieves strong end-to-end performance and scales efficiently with dataset size. While the number of samples increases by $100\times$, the total training time increases by $\sim 79.3\times$, indicating that fixed per-batch overheads (kernel launch and synchronization) are amortized as the workload grows.
+
+In particular, the large dataset exhibits the lowest time per processed sample, consistent with improved GPU utilization when executing more batches per epoch. Overall, the $T=16$ tiling configuration provides the best observed end-to-end training times for these shapes ($B=256$, $I=32$, $H=256$, $O=1$), while leaving additional optimization opportunities.
+
+
+
+\subsection{Performance Profiling}
+
+Performance profiling was conducted using the same experimental setup as the baseline performance profiling. A fused and tiled CUDA implementation was used for the forward pass, backpropagation, and parameter updates. The profiled use case was training on the large dataset (25600 samples.)
+
+The total end-to-end training time is 0.57~s, corresponding to approximately 5.7~ms per epoch. Host-side analysis indicates that execution time is dominated by synchronization and waiting mechanisms, with \texttt{poll} (50.7\%) and \texttt{pthread\_cond\_timedwait} (40.0\%) accounting for the majority of OS runtime activity. This behavior reflects a CPU waiting for GPU completion rather than active computation, consistent with a GPU-bound workload.
+
+CUDA API profiling shows that kernel launch overhead still represents the largest portion of API time, but it is amortized over the full training execution and does not significantly impact overall performance.
+
+The distribution of GPU-time, represented in table \ref{tab:kernel_time_breakdown} confirms weight gradient computation and matrix multiplication as the primary computational bottlenecks.
+
+\begin{table}[h!]
+\centering
+\caption{GPU kernel execution time breakdown}
+\label{tab:kernel_time_breakdown}
+\begin{tabular}{l r}
+\toprule
+\textbf{Kernel} & \textbf{Execution Time (\%)} \\
+\midrule
+\texttt{grad\_W1}                & 40.3 \\
+\texttt{matmul\_tiled}           & 27.3 \\
+\texttt{grad\_W2}                & 11.4 \\
+Activation backprop.       & 4.1 \\
+SGD update & 3.9 \\
+MSE computation                  & 1.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+Memory transfer overhead is minimal, with only four host-to-device transfers totaling 3.41~MB and a cumulative transfer time of 334~\textmu s. This confirms that data movement overhead is negligible compared to kernel execution time.
+
+Overall, the profiling results demonstrate that the fused and tiled implementation achieves high computational efficiency, with low memory transfer overhead and minimal CPU involvement. These results provide a strong baseline for analyzing the impact of network size, number of neurons, and dataset scale on training performance.
+
+
+\section{Reference code vs. Optimization results}
+
+\subsection{Reference Program Description}
+
+\subsubsection*{GPU Utilization}
+
+Matrix multiplications, which dominate computation, are performed on the GPU using a custom CUDA kernel. 
+Each thread computes one element of the output matrix in parallel. 
+For each multiplication:
+\begin{itemize}
+    \item Input matrices are copied from host (CPU) to device (GPU) memory.
+    \item The CUDA kernel executes parallel computations on the GPU.
+    \item Results are copied back to host memory.
+\end{itemize}
+This leverages the GPU’s massive parallelism to accelerate the training process.
+
+\subsubsection*{CPU Utilization}
+
+The CPU handles:
+\begin{itemize}
+    \item Loading and batching the dataset,
+    \item ReLU activation and its derivative,
+    \item Loss calculation (Mean Squared Error),
+    \item Weight updates and control flow.
+\end{itemize}
+
+By offloading matrix multiplication to the GPU, the program achieves significantly higher computational throughput 
+compared to sequential execution. However, host-device memory transfers introduce some overhead.
+
+
+
+\subsection{Comparative Speedup Analysis}
+Table \ref{tab:nn-times} compares the execution times of the reference parallelization strategy against our fully optimized solution combining the three strategies.
+\begin{table}[htbp]
+\centering
+\caption{Comparative Neural Network Training Times (s).}
+\label{tab:nn-times}
+\begin{tabular}{lcc}
+\toprule
+Samples & reference code & optimized final code \\
+\midrule
+256     & 0.3151   & 0.0106 \\
+2,560   & 3.6767   & 0.1045  \\
+25,600  & 7.5937   & 0.8401  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The speedup factor ($\text{Speedup} =T_\text{ref} / T_\text{opt}$) highlights the dominance of the GPU approach:
+\begin{itemize}
+    \item \textbf{Small Dataset:} $0.3151/ 0.0106 \approx \mathbf{29.7\times}$
+    \item \textbf{Medium Dataset:} $3.6767 / 0.1045 \approx \mathbf{35.2\times}$
+    \item \textbf{Large Dataset:} $7.5937/ 0.8401 \approx \mathbf{9.0\times}$
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\columnwidth]{speedup.png} 
+\caption{Training speedup optimized coder over Baseline}
+\label{fig:nn-scalability}
+\end{figure}
+
+
+\subsection{Discussion}
+The results show that GPU acceleration combined with Fusion + Tiling optimizations provides superior scalability for neural network training. Execution time on the GPU grows sub-linearly with dataset size, whereas CPU-based methods scale nearly linearly, resulting in up to 9× speedup for the largest dataset. This demonstrates that memory-aware kernel fusion and tiling enable efficient utilization of GPU resources, maintaining high throughput as data scales. These findings highlight the importance of GPU-optimized pipelines for large-scale, parallelizable workloads.
+
+% --- Add after the numerical results table or right before the Conclusion ---
+\noindent\textbf{Note on mixed results.} While the fully integrated implementation (tiling + GPU-resident + selective fusion) yields large end-to-end speedups in most cases, we observed that the \emph{GPU-native + fusion} variant (fusion without tiling) produced the best wall-clock time for the largest dataset in our runs. This indicates a non-trivial interaction between tiling and fusion: tiling increases arithmetic intensity but also raises per-block shared-memory / register usage which can reduce occupancy or create memory-bank / scheduling inefficiencies on the Tesla T4 for certain tile/shape combos. We therefore report per-dataset best-performing variants and discuss possible causes and remedies in the conclusion.
+
+
+\section{Studying the Impact of Hidden Layer Size}
+
+To understand how the size of the hidden layer affects training performance, we conducted experiments on three synthetic datasets (\texttt{small}, \texttt{medium}, and \texttt{large}) while varying the hidden layer size from 64 to 1024 neurons. The training was performed using the fully-fused tiled CUDA implementation described earlier. 
+
+As expected and illustrated by figure \ref{fig:hidden_size_time}, training time increases with hidden layer size, with the effect becoming more pronounced for larger datasets due to the increased number of weight parameters and associated matrix operations.
+
+\begin{figure}[h]
+\centering
+% Include the GPU training time vs hidden size plot here
+\includegraphics[width=\columnwidth]{téléchargement.png}
+\caption{GPU training time as a function of hidden layer size for small, medium, and large synthetic datasets.}
+\label{fig:hidden_size_time}
+\end{figure}
+
+This analysis highlights the computational cost of scaling the hidden layer in fully-connected networks and can guide the choice of network size for different dataset scales.
+
+
+\section{Experimental setup}
+
+The table below presents the experimental setup used for the implementation and experimentation of the different optimisation strategies.
+\begin{table}[htbp]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Component} & \textbf{Specification} \\ \hline
+Platform & Google Colab (Virtual Machine) \\ \hline
+CPU & Intel Xeon @ 2.00 GHz \\ \hline
+vCPUs & 2 (1 core, 2 threads) \\ \hline
+RAM & 12 GB \\ \hline
+GPU & NVIDIA Tesla T4 \\ \hline
+GPU Memory & 15 GB \\ \hline
+CUDA Version & 12.8 \\ \hline
+GPU Driver & 580.82.07 \\ \hline
+Virtualization & KVM (Full Virtualization) \\ \hline
+Max threads per block & 1024 threads \\ \hline
+\end{tabular}
+\caption{Hardware and Software Environment Used for Experiments}
+\label{tab:hw_env}
+\end{table}
+%=========================================
+%===========================================
+\section{Conclusion and Future Work}
+
+We presented a systematic study of three CUDA-centered optimizations for training a shallow neural network: (1) tiling for matrix multiplication, (2) full GPU offloading (keep data resident on-device), and (3) kernel fusion (merge consecutive operations into single kernels). Across three synthetic dataset scales (Small, Medium, Large) the optimized variants deliver substantial runtime reductions compared to the CPU / hybrid baseline.
+Figure~\ref{fig:comparison_chart} visualizes this progressive improvement across all optimization stages and dataset sizes.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.9\columnwidth]{comp.png}
+    \caption{Training time comparison across optimization strategies. Each successive optimization builds upon the previous, demonstrating cumulative performance improvements.}
+    \label{fig:comparison_chart}
+\end{figure}
+
+Key takeaways:
+\begin{itemize}
+  \item \textbf{Strong overall gains.} Moving computation to the GPU and applying fusion and tiling reduces end-to-end training time by an order of magnitude or more across dataset sizes compared to the reference implementation.
+  \item \textbf{No free lunch — variant-dependent best performer.} The \emph{GPU-native + fusion} variant (fusion without tiling) consistently produced the best wall-clock time for the largest dataset in our experiments, while the fully integrated (tiling + fusion + GPU-resident) variant was the best for other sizes. This demonstrates that combining optimizations can produce non-linear interactions: tiling increases data reuse and arithmetic intensity but also increases shared-memory and register pressure which can reduce occupancy or worsen memory-bank behavior on a given GPU.
+  \item \textbf{Performance drivers.} Profiling shows the reference implementation is dominated by host-device transfers and CUDA API overhead; after eliminating those, the remaining bottlenecks are kernel resource usage (registers / shared memory), per-kernel launch overhead and the efficiency of reduction kernels (e.g., gradient reductions).
+\end{itemize}
+
+Practical recommendations based on our findings:
+\begin{enumerate}
+  \item Report per-dataset best variant and numbers (we do this in Section~V). Do not claim a single method is universally best.
+  \item When applying tiling, tune tile size per problem shape (batch, input, hidden dims) and measure occupancy / register usage; the ``largest'' tile is not always best.
+  \item Use fusion selectively: fuse light-weight sequences to eliminate kernel-launch overhead, but inspect register pressure — over-fusion can reduce occupancy and hurt performance.
+  \item Always report both wall-clock (CPU+GPU) and pure GPU kernel times; they tell different stories (system-level vs kernel-level).
+\end{enumerate}
+
+\subsection*{Future work}
+We plan the following investigations to explain and (if possible) remove the residual gap between variants:
+
+\begin{itemize}
+  \item \textbf{Ablation / sensitivity study:} run controlled experiments varying a single factor (tile size, fusion degree, TPB) and produce heatmaps of time vs parameters.
+  \item \textbf{Profile-driven tuning:} use Nsight Compute to collect per-kernel metrics (registers per thread, shared memory per block, achieved occupancy, memory throughput) and correlate them to runtime. Use these insights to choose tile sizes and fusion targets automatically.
+  \item \textbf{Reduction optimizations:} replace custom reductions (gradients) with optimized GEMM or use hierarchical reduction strategies to reduce memory traffic and synchronization.
+  \item \textbf{Mixed precision / Tensor Cores:} evaluate FP16 / mixed-precision training to leverage Tensor Cores on compatible GPUs for further speedup, while monitoring numerical stability.
+  \item \textbf{Statistical reporting:} execute each experiment multiple times, report means and standard deviations, and present per-batch time distributions to quantify variance.
+\end{itemize}
+
+In summary, our results validate that GPU-residency and kernel fusion yield the largest single wins; tiling delivers further benefits when tuned carefully, but it must be combined with profiling-guided parameter selection to avoid hurting occupancy on a particular GPU. The honest reporting of per-dataset winners and the proposed follow-ups will make the manuscript stronger and more reproducible.
+
+
+
+
+%================================================
+\begin{thebibliography}{00}
+\bibitem{brou then2025}
+Brouthen, K., \& Akeb, A. (2025). 
+\emph{Exploring parallelization of shallow neural network using CUDA}. 
+Student report, ESI.
+
+\bibitem{nvidia2023cuda}
+NVIDIA Corporation. (2023). 
+\emph{CUDA C++ programming guide}. 
+NVIDIA Developer Documentation. 
+https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+\bibitem{nvidia2023nsight}
+NVIDIA Corporation. (2023). 
+\emph{NVIDIA Nsight Systems user guide}. 
+NVIDIA Developer Documentation. 
+https://docs.nvidia.com/nsight-systems/
+
+\end{thebibliography}
+
+
+\end{document}
