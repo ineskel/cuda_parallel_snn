@@ -1,0 +1,8 @@
+Number of CUDA-capable devices: 1
+Device 0: NVIDIA GeForce GTX 1650
+  Compute capability: 7.5
+  Total global memory: 3718 mega bytes
+  Multiprocessor count: 14
+  Max threads per block: 1024
+  Max threads dimensions: 1024 x 1024 x 64
+  Max grid size: 2147483647 x 65535 x 65535
